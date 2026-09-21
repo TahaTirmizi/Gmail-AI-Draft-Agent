@@ -1,0 +1,274 @@
+/**
+ * ============================================================
+ * GMAIL AI DRAFT AGENT
+ * ============================================================
+ * Reads labeled emails, generates AI-suggested replies using
+ * the Gemini API, and saves them as Gmail DRAFTS ONLY.
+ * This script NEVER sends email automatically.
+ * ============================================================
+ */
+
+// ---------- CONFIGURATION ----------
+
+const GEMINI_MODEL = 'gemini-3.6-flash';
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent';
+
+const TRIGGER_LABEL_NAME = 'NEEDS_AI_REPLY';       // apply this label to emails you want drafted
+const PROCESSED_LABEL_NAME = 'AI_DRAFT_PROCESSED'; // applied automatically once handled
+const MAX_EMAILS_PER_RUN = 5;                      // safety cap per run
+
+
+// ---------- SECRETS ----------
+
+function getApiKey() {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!apiKey) {
+    throw new Error('GEMINI_API_KEY is missing. Go to Project Settings > Script Properties and add it.');
+  }
+  return apiKey;
+}
+
+
+// ---------- AI CALL ----------
+
+function callGeminiAPI(promptText) {
+  const apiKey = getApiKey();
+
+  const payload = {
+    contents: [{ parts: [{ text: promptText }] }]
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': apiKey },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(GEMINI_URL, options);
+  const responseCode = response.getResponseCode();
+  const responseText = response.getContentText();
+
+  if (responseCode === 429) {
+    throw new Error('Gemini rate limit hit (429). Consider lowering MAX_EMAILS_PER_RUN or trigger frequency.');
+  }
+  if (responseCode !== 200) {
+    throw new Error('Gemini API error (' + responseCode + '): ' + responseText);
+  }
+
+  const data = JSON.parse(responseText);
+
+  if (!data.candidates || data.candidates.length === 0) {
+    throw new Error('Gemini returned no candidates. Full response: ' + responseText);
+  }
+
+  const aiText = data.candidates[0].content.parts[0].text;
+
+  if (!aiText || aiText.trim() === '') {
+    throw new Error('Gemini returned an empty text response.');
+  }
+
+  return aiText.trim();
+}
+
+
+// ---------- EMAIL EXTRACTION ----------
+
+function extractEmailData(thread) {
+  const messages = thread.getMessages();
+  const latestMessage = messages[messages.length - 1];
+
+  return {
+    thread: thread,
+    message: latestMessage,
+    sender: latestMessage.getFrom(),
+    subject: thread.getFirstMessageSubject(),
+    body: latestMessage.getPlainBody(),
+    date: latestMessage.getDate()
+  };
+}
+
+
+// ---------- SAFETY FILTER ----------
+
+function isSafeToReply(emailData) {
+  const subject = (emailData.subject || '').toLowerCase();
+  const body = (emailData.body || '').toLowerCase();
+  const sender = (emailData.sender || '').toLowerCase();
+
+  if (body.trim().length < 5) {
+    Logger.log('SKIPPED (unsafe): body is empty or too short.');
+    return false;
+  }
+
+  const noReplyPatterns = ['no-reply', 'noreply', 'do-not-reply', 'donotreply', 'notifications@', 'notification@'];
+  if (noReplyPatterns.some(function(p) { return sender.indexOf(p) !== -1; })) {
+    Logger.log('SKIPPED (unsafe): sender looks like an automated/no-reply address.');
+    return false;
+  }
+
+  const sensitiveKeywords = [
+    'password', 'reset your password', 'verify your account', 'confirm your identity',
+    'wire transfer', 'bank account', 'social security', 'ssn', 'routing number',
+    'gift card', 'urgent payment', 'suspended account', 'click here immediately'
+  ];
+  const combinedText = subject + ' ' + body;
+  const foundKeyword = sensitiveKeywords.find(function(k) { return combinedText.indexOf(k) !== -1; });
+  if (foundKeyword) {
+    Logger.log('SKIPPED (unsafe): matched sensitive keyword "' + foundKeyword + '".');
+    return false;
+  }
+
+  const marketingPatterns = ['unsubscribe', '% off', 'sale ends', 'newsletter', 'limited time offer'];
+  const foundMarketing = marketingPatterns.find(function(p) { return combinedText.indexOf(p) !== -1; });
+  if (foundMarketing) {
+    Logger.log('SKIPPED (unsafe): matched marketing pattern "' + foundMarketing + '".');
+    return false;
+  }
+
+  return true;
+}
+
+
+// ---------- PROMPT BUILDING ----------
+
+function buildReplyPrompt(emailData) {
+  const systemInstructions =
+    'You are an email assistant that drafts professional, natural-sounding reply suggestions.\n' +
+    'Rules you must follow:\n' +
+    '- Understand the sender\'s intent before replying.\n' +
+    '- Be concise unless the email genuinely requires detail.\n' +
+    '- Maintain a professional, natural tone.\n' +
+    '- NEVER invent facts, meetings, attachments, files, or prior conversations that are not in the email below.\n' +
+    '- NEVER claim you have access to a calendar, files, or scheduling tools — you do not.\n' +
+    '- NEVER make commitments (dates, promises, confirmations) unless the email provides clear evidence to base them on.\n' +
+    '- If the email cannot be answered without information you don\'t have, write a reply that asks a clarifying question instead of guessing.\n' +
+    '- Output ONLY the reply text itself. No subject line, no explanation, no "Here is a draft:" preamble.\n\n';
+
+  const emailBlock =
+    'Here is the email to reply to:\n\n' +
+    'From: ' + emailData.sender + '\n' +
+    'Subject: ' + emailData.subject + '\n\n' +
+    emailData.body;
+
+  return systemInstructions + emailBlock;
+}
+
+
+// ---------- DRAFT CREATION ----------
+
+function createReplyDraft(emailData, replyText) {
+  try {
+    const draft = emailData.message.createDraftReply(replyText);
+    Logger.log('Draft created successfully. Draft ID: ' + draft.getId());
+    return draft;
+  } catch (err) {
+    throw new Error('Failed to create draft: ' + err.message);
+  }
+}
+
+
+// ---------- DUPLICATE PREVENTION ----------
+
+function getProcessedLabel() {
+  let label = GmailApp.getUserLabelByName(PROCESSED_LABEL_NAME);
+  if (!label) {
+    label = GmailApp.createLabel(PROCESSED_LABEL_NAME);
+    Logger.log('Created new label: ' + PROCESSED_LABEL_NAME);
+  }
+  return label;
+}
+
+function isAlreadyProcessed(thread) {
+  const label = getProcessedLabel();
+  const threadLabels = thread.getLabels();
+  return threadLabels.some(function(l) { return l.getName() === label.getName(); });
+}
+
+function markAsProcessed(thread) {
+  const label = getProcessedLabel();
+  thread.addLabel(label);
+  Logger.log('Marked thread as processed: ' + thread.getFirstMessageSubject());
+}
+
+
+// ---------- ELIGIBILITY / BATCH PROCESSING ----------
+
+/**
+ * Finds eligible threads: unread in inbox, not yet AI_DRAFT_PROCESSED.
+ * No manual labeling required — this replaces the NEEDS_AI_REPLY label rule.
+ */
+function findEligibleThreads() {
+  // Gmail search syntax: unread emails in inbox, excluding ones already labeled processed
+  const query = 'is:unread in:inbox -label:' + PROCESSED_LABEL_NAME;
+  const threads = GmailApp.search(query, 0, 20);
+
+  return threads.slice(0, MAX_EMAILS_PER_RUN);
+}
+
+function processSingleThread(thread) {
+  const subject = thread.getFirstMessageSubject();
+
+  try {
+    const emailData = extractEmailData(thread);
+
+    if (!isSafeToReply(emailData)) {
+      Logger.log('SKIPPED (safety filter): "' + subject + '"');
+      markAsProcessed(thread);
+      return 'skipped';
+    }
+
+    const prompt = buildReplyPrompt(emailData);
+    const aiReply = callGeminiAPI(prompt);
+
+    createReplyDraft(emailData, aiReply);
+    markAsProcessed(thread);
+
+    Logger.log('SUCCESS: Drafted reply for "' + subject + '"');
+    return 'success';
+  } catch (err) {
+    Logger.log('FAILED to process "' + subject + '": ' + err.message);
+    return 'failed';
+  }
+}
+
+
+// ---------- MAIN ENTRY POINT ----------
+
+function processEligibleEmails() {
+  const eligibleThreads = findEligibleThreads();
+
+  Logger.log('Found ' + eligibleThreads.length + ' eligible thread(s) to process (max ' + MAX_EMAILS_PER_RUN + ' per run).');
+
+  if (eligibleThreads.length === 0) {
+    Logger.log('Nothing to do. Exiting.');
+    return;
+  }
+
+  let successCount = 0;
+  let skippedCount = 0;
+  let failCount = 0;
+
+  eligibleThreads.forEach(function(thread) {
+    const result = processSingleThread(thread);
+    if (result === 'success') successCount++;
+    else if (result === 'skipped') skippedCount++;
+    else failCount++;
+  });
+
+  Logger.log('Run complete. Drafted: ' + successCount + ', Skipped (safety): ' + skippedCount + ', Failed (error): ' + failCount);
+}
+
+
+// ---------- MANUAL TEST HELPERS (safe to keep, never run automatically) ----------
+
+function testApiKeyLoads() {
+  const key = getApiKey();
+  Logger.log('API key loaded successfully. Starts with: ' + key.substring(0, 6) + '...');
+}
+
+function testGeminiConnection() {
+  const result = callGeminiAPI('Reply with a single short sentence confirming you received this test message.');
+  Logger.log('Gemini responded: ' + result);
+}
